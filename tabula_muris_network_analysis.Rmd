@@ -1,0 +1,1021 @@
+---
+title: "Network analysis of Tabula Muris' Gene Regulatory Networks"
+author: "Ramon Massoni-Badosa"
+date: "2019/03/07"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+In this vignette, we will analyze 11 gene regulatory networks (GRN) derived from single cell RNA-seq (scRNA-seq) data from the model organism Mus musculus. The original scRNA-seq data comes from the [Tabula Muris Consortium](https://www.nature.com/articles/s41586-018-0590-4) and can be accessed by following [this link](https://figshare.com/projects/Tabula_Muris_Transcriptomic_characterization_of_20_organs_and_tissues_from_Mus_musculus_at_single_cell_resolution/27733). The networks here analysed correspond to the following organs:
+
+- Bladder
+- Brain
+- Fat
+- Heart
+- Intestine
+- Lung
+- Mammary gland
+- Bone marrow
+- Pancreas
+- Spleen
+- Skin
+
+and were generated as described in [our paper](https://www.biorxiv.org/content/10.1101/446104v1).
+For each network, the nodes correspond to expressed genes in that specific organ, while edges indicate that two nodes are either coexpressed (positive correlation), or mutually exclusive (negative correlation). 
+
+## Package loading
+First, let us load the required packages:
+
+```{r}
+library(tidyverse)
+library(igraph)
+library(ggpubr)
+library(ggdendro)
+library(ggalt)
+library(gplots)
+library(ClassDiscovery)
+library(org.Mm.eg.db) 
+library(GOstats)
+library(VennDiagram)
+library(limma)
+library(biomaRt)
+library(RcisTarget)
+library(zoo)
+library(DT)
+library(VennDiagram)
+library(grDevices)
+library(extrafont)
+library(purrr)
+library(fmsb)
+```
+
+
+## Data import
+Let us load the networks (saved as edgelists) and convert them to `igraph` objects. `igraph` is a collection of network analysis tools that we will use in this analysis:
+
+```{r}
+# net_files: named character vector with the name of the 11 network files
+net_files <- str_c("data/networks", dir("data/networks"), sep = "/")
+names(net_files) <- str_replace(
+  dir("data/networks"), 
+  pattern = ".txt", 
+  replacement = ""
+)
+
+# net_list: list with 11 df, corresponding to the 11 networks as edgelists
+net_list <- map(
+  net_files, 
+  read_csv, 
+  col_names = c("node1", "node2", "corr"), 
+  col_types = c("ccd"), 
+  skip = 1
+)
+```
+
+## Conversion to igraph objects
+
+```{r}
+# net_graphs: list with 11 networks as igraph objects. 
+# The gene aliases are converted to official mgi symbols
+# if a gene name is converted to NA, change it back to its initial symbol.
+net_graphs <- map(
+  net_list, 
+  ~ graph_from_edgelist(as.matrix(.[, 1:2]), directed = FALSE)
+)
+                                                  
+net_vertices <- map(net_graphs, ~ V(.)$name)  
+net_vertices_off <- map(net_vertices, limma::alias2SymbolTable, species = "Mm")
+net_graphs <- pmap(list(net_graphs, net_vertices, net_vertices_off), 
+                   ~ set_vertex_attr(graph = ..1, 
+                                     name = "name", 
+                                     value = replace(..3, 
+                                                     which(is.na(..3)), 
+                                                     ..2[which(is.na(..3))])))
+
+saveRDS(net_graphs, "results/R_objects/networks_igraphs.rds")
+```
+
+We have a list (net_graphs) containing 11 graph objects, one for each network. This will allow us to work in a vectorized-fashion and compute the centrality measures for all networks at once.
+
+# Centrality Measures
+
+Network centrality measures (CM) are node-centric, meaning that one can calculate each of the CM for each of the nodes. These CM allow one to rank nodes from most to less important according to a given criterion. We will work with the following CM:
+
+1. Degree: refers to the number of edges a node has to other nodes. Indicates the probability of getting the information spreading in the network.
+2. Betweenness: refers to how frequently a node lies on the shortest path between any two nodes in the network. Indicates the ability to control information.
+3. Closeness: refers to the reciprocal of the sum of the minimal distances of a vertex to all other vertices. Indicates the speed of getting the information.
+4. Eigenvector: the core idea of the eigencentrality is that an important node is connected to important neighbors ("being linked to central nodes"). 
+5. Pagerank: pagerank was created by google. According to them: PageRank works by counting the number and quality of links to a page to determine a rough estimate of how important the website is. 
+
+##Centrality Measures calculation
+
+Let us compute the centralities for each node in each network:
+
+```{r}
+# Degree centrality
+net_k <- map(net_graphs, igraph::degree) 
+
+# Betweenness centrality
+net_bc <- map(net_graphs, betweenness)
+
+# Closeness centrality
+net_close <- map(net_graphs, closeness)
+
+# Eigen centrality
+net_eigen <- map(net_graphs, ~ eigen_centrality(.)$vector, directed = FALSE)
+
+# Pagerank centrality
+net_page <- map(net_graphs, ~ page_rank(.)$vector, directed = FALSE)
+```
+
+Note that closeness gives problems in disconnected networks.
+
+## Correlation between CM
+
+As we explained above, we will use 5 different CM, each of which provides a different criterion for what a central node is. As described in [this paper](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1184047/), there exists a significant correlation between CM in biological networks. Specifically, it has been reported that nodes with a very high degree tend to have high betweenness and closeness. However, nodes with a low degree have a large variance in betweenness and closeness, meaning that a gene can have a low degree but a very high betweenness. For instance, these nodes are referred to as bottlenecks, and they are crucial to the flow of information between networks modules. Thus, we will assess if we can depict similar correlations in our networks:
+
+```{r}
+# arranged_gg: list of 4 ggplot objects. Each object contains 4 scatterplots,
+# corresponding to the correlation between degree and the other 4 CM for a 
+# subset of 4 organs (intestine, pancreas, skin and spleen).
+net_centr_l <- list(net_k, net_bc, net_close, net_eigen, net_page)
+centralities <- c("degree", "betweenness", "closeness", "eigen", "pagerank")
+names(net_centr_l) <- centralities
+orgs_interest <- c("intestine", "pancreas", "skin", "spleen")
+centr_interest <- c("closeness", "pagerank", "eigen", "betweenness")
+arranged_gg <- list()
+
+for (org in orgs_interest) {
+  org_gg <- list()
+  for (centr in centr_interest) {
+    org_gg[[centr]] <- net_centr_l %>% 
+      map(org) %>% 
+      bind_cols() %>% 
+      ggplot(aes_string("degree", centr)) +
+        geom_point(shape = 1, color = "#0071bd", size = 1.5, alpha = 0.5) +
+        scale_x_log10("DEGREE") +
+        scale_y_log10(str_to_upper(centr)) +
+        theme_classic() +
+        theme(axis.title = element_text(size = 10))
+  }
+  arranged_gg[[org]] <- ggarrange(plotlist = org_gg, nrow = 2, ncol = 2)
+  arranged_gg[[org]] <- annotate_figure(arranged_gg[[org]],
+                                        top = text_grob(org, size = 18))
+}
+
+arranged_gg$spleen
+
+# Save each plot object in arranged_gg as pdf
+walk(names(arranged_gg), function(gg) {
+  ggsave(
+    filename = str_c("results/plots/correlation_CM_", gg, ".pdf"),
+    plot = arranged_gg[[gg]], 
+    device = "pdf"
+  )
+})
+
+saveRDS(net_centr_l, "results/R_objects/networks_centralities.rds")
+```
+
+Indeed, wee see how the pattern we expected: correlated CM, with low-degree nodes having a larger variability of other centralities.
+
+## Definition of central genes
+
+By ranking nodes by decreasing centrality measure we can get an idea of which genes are the most important for that particular system. We will define as "central" genes those within the top 20% of the ranking, as performed [here](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.0030059): 
+
+```{r}
+# top_centr: list of lists containing the mgi gene symbols of the top 20%  
+# central nodes for each organ (inner list) and centrality (outer list)
+top_centr <- vector("list", length(centralities))
+names(top_centr) <- centralities
+
+for (centr in centralities) { 
+  top_centr[[centr]] <- net_centr_l[[centr]] %>% 
+    map(sort, decreasing = TRUE) %>%
+    map(~ names(.[1:(length(.) * 0.2)]))
+}
+str(top_centr)
+saveRDS(top_centr, "results/R_objects/networks_hub_lists.rds")
+```
+
+We now have 110 sets of hubs (11 networks x 5 CM).
+
+## Different CM identify different sets of central genes
+
+In agreement with the previous scatter plots, we expect that there are genes that are ranked as central by more than one CM; as well as others that are CM-specific. We can visualize this using Venn diagrams:
+
+```{r}
+# Create 11 venn diagrams (one per organ), depicting the overlapping between
+# each set of hubs (one per centrality). Save them in pdf format in the 
+# plots/venn_diagrams folder
+organs <- names(net_graphs)
+loadfonts()
+
+for (org in organs) {
+  hubs <- map(top_centr, org)
+  venn_centr <- venn.diagram(hubs, fill = 2:6, alpha = 0.3, filename = NULL,
+                  cat.just = list(c(0.6,1), c(0,0), c(0,0), c(1,1), c(1,0)))
+  venn_file <- str_c("results/plots/venn_diagrams/venn_cm_", org, ".pdf")
+  pdf(file = venn_file)
+  grid.draw(venn_centr)
+  dev.off()
+}
+
+grid.draw(venn_centr)
+```
+
+Indeed, we see how there are some genes that are in the top 20% nodes for all CM. Moreover, some genes are specific for each CM.
+
+
+# Single-cell derived regulatory networks are scale-free
+As reviewed by [Barabási AL, et al. (2004)](https://www.nature.com/articles/nrg1272), biological networks are scale-free, as their degree distribution follows a power-law. In other words, there is both a high proportion of nodes with a very low degree (few connections) and a low proportion of nodes with high degree (referred to as hubs). This makes biological networks robust against random perturbation, as the whole system will fail only if hubs are compromised, which is unlikely.
+
+Thus, something we aim to test to validate our networks is whether they are scale-free. To that end, we will use a Kolmogorov-Smirnov test to compare the degree distribution of our networks to a theoretical power-law distribuiton, with the null hypothesis that they are equal. Hence, p-values > 0.05 will be indicative of scale-free networks. Moreover, we will also compute the ⍺, that is, the exponent of the power-law. It has been reported that biological networks have exponents between 2 and 3. 
+
+## Visualizing scale-free distribution: histograms
+
+Let us visualize the degree distribution with a histogram:
+
+```{r}
+# net_k_df: data.frame that contains the degree for all nodes in all organs.
+net_k_df <- net_k %>% 
+  map(as.data.frame) %>% 
+  bind_rows(.id = "organ") %>% 
+  set_names(c("organ", "degree"))
+
+# k_hists: list with 11 histograms that show the degree distribution in every
+# network.
+k_hists <- organs %>% 
+  map(~ filter(net_k_df, organ == .) %>% 
+        ggplot(aes(x = degree)) +
+          geom_histogram(binwidth = 15, color = "black") +
+          ggtitle(str_to_title(.)) +
+          scale_x_continuous("Degree", expand = c(0.025, 0.025)) +
+          scale_y_continuous("", expand = c(0.025, 0.025)) +
+          theme_classic() +
+          theme(axis.title.x = element_text(size = 11),
+                plot.title = element_text(hjust = 0.5, vjust = 0, size = 14, 
+                                          face = "bold")) 
+  )
+names(k_hists) <- organs
+
+# Save plots: k_hists as a single graph with the 11 plots distributed in 6 rows
+# and 2 cols.
+k_hists_out <- ggarrange(plotlist = k_hists, nrow = 4, ncol = 3, vjust = 0)
+ggsave(
+  "results/plots/scale_free_plots/scale_free_histograms.pdf", 
+  plot = k_hists_out, 
+  device = "pdf", 
+  height = 24, 
+  width = 18, 
+  units = "cm"
+)
+k_hists_out
+```
+
+## Power-law fit to the degree distibution: scatter plots
+
+With both axes in log-scale the power-law fit is visualized as a decreasing line. This time, we also include the p-value and alpha:
+
+```{r}
+# net_k_df2: data.frame that contains the degree distribution for all organs
+# degree distribution (P(k)): probability that a selected node has exactly k 
+# links
+net_k_distr <- map(net_graphs, degree_distribution)
+len_dist <- map_dbl(net_k_distr, length)   
+net_k_df2 <- list(len_dist, net_k_distr) %>% 
+  pmap(~ cbind(0:(..1 - 1), ..2)) %>% 
+  map(as.data.frame) %>% 
+  bind_rows(.id = "organ") %>% 
+  set_names(c("organ", "degree", "freq")) %>% 
+  filter(degree != 0)
+
+# ks_test: list with the results of the power law fit to the 11 degree 
+# distributions. KS.p contains the p-value of the Kolmogorov-Smirnov test,
+# and alpha contains the exponent of the power law: P(k) = k^-alpha
+ks_test <- map(net_k, fit_power_law)
+
+# k_logs_gg: list with 11 scatter plots, showing the 11 degree distributions in
+# log-log scale.
+get_ks_stat <- function(organ, stat){
+  # Returns the desired statistic for the power law fit to the degree 
+  # distribution of the network of a certain organ
+  # 
+  # Args:
+  #   organ: string specifies the organ of interest
+  #   stat: string of the statistic of interest (p-value or alpha)
+  stat1 <- ifelse(stat == "p-value", "KS.p", "alpha")
+  stat2 <- formatC(ks_test[[organ]][[stat1]], digits = 2)
+  ifelse(stat == "p-value", "KS.p", "\u03B1") %>% 
+  str_c(" = ", stat2, collapse = TRUE)
+}
+
+x_labels <- expression("10", "10"^2)
+y_labels <- expression("10"^-3, "10"^-2, "10"^-1)
+k_logs_gg <- organs %>% 
+  map(~ filter(net_k_df2, organ == .) %>% 
+        ggplot(aes(degree, freq)) +
+            geom_point(color = "#003CFF", size = 1) +
+            geom_smooth(method = "lm", se = FALSE, color = "#003CFF") +
+            annotate("text", 
+                     x = 11, 
+                     y = 0.3,
+                     label = str_c(get_ks_stat(., "p-value"), 
+                                   "\n",
+                                   get_ks_stat(., "alpha")),
+                     size = 4,
+                     hjust = 0) +
+            scale_x_log10("Degree", expand = c(0,0), breaks = c(10, 100), 
+                          labels = x_labels, limits = c(1, 200)) +
+            scale_y_log10("Density", breaks = c(0.001, 0.01, 0.1), 
+                          labels = y_labels) +
+            expand_limits(x = 1, y = 0) +
+            theme_classic() + 
+            theme(panel.grid.major = element_line(color = "lightgrey"),
+                  panel.border = element_rect(colour = "black", fill = NA),
+                  axis.title = element_text(size = 13))
+  )
+names(k_logs_gg) <- organs
+
+# Save each scatterplot as pdf file
+walk2(k_logs_gg, organs, function(gg, org) {
+  ggsave(
+    str_c("results/plots/scale_free_plots/scale_free_scater_", org, ".png"),
+    plot = gg, 
+    device = "png", 
+    width = 6, 
+    height = 6, 
+    units = "cm"
+  )
+})
+k_logs_gg$heart
+```
+
+# Multiplicity of the top central nodes
+
+Another essential question we aim to answer is whether these hubs are specific to a particular organ (organ-specific hubs) or whether they are hubs in several organs (ubiquitous hubs). To assess this question, let us compute and plot the multiplicity of each hub (i.e. # organs a given gene acts as a hub):
+
+##  Inspect multiplicity
+
+```{r}
+# hub_multi_df: df that contains, for each organ and CM, the percentage of hubs 
+# that have a multiplicity of 1, 2 or 3+ (i.e. are hubs in 3 or more organs).
+hub_multi_df <- data.frame(
+  centrality = c(), 
+  organ = c(), 
+  multiplicity = c(), 
+  percentage = c()
+)
+
+for (centr in centralities) {
+  centr_counts <- table(unlist(top_centr[[centr]]))  
+  for (org in organs) {
+    curr_hubs <- top_centr[[centr]][[org]]
+    multipl <- table(centr_counts[curr_hubs]) 
+    mult_perc <- c(
+      "1" = multipl[1] / sum(multipl) * 100,
+      "2" = multipl[2] / sum(multipl) * 100,
+      "3+" = sum(multipl[3:length(multipl)]) / sum(multipl) * 100
+    )
+    curr_mult_df <- data.frame(
+      centrality = rep(centr, 3), 
+      organ = rep(org, 3), 
+      multiplicity = c("1", "2", "3+"), 
+      percentage = mult_perc
+    )
+    hub_multi_df <- bind_rows(hub_multi_df, curr_mult_df)
+  }
+}
+
+# hub_multi_gg: stacked bar plot showing the multiplicity distribition per organ
+# and centrality.
+bar_colors <- c("#ff8533", "#599ad3", "#9e66ab")
+hub_multi_df$multiplicity <- factor(hub_multi_df$multiplicity,
+                                    levels = c("3+", "2", "1")) 
+hub_multi_gg <- hub_multi_df %>% 
+                ggplot(aes(organ, percentage, 
+                           fill = multiplicity)) +
+                  geom_bar(stat = "identity", colour = "black") +
+                  scale_x_discrete(name = "") +
+                  scale_y_continuous(name = "Percentage", expand = c(0,0)) +
+                  scale_fill_manual(name = "multiplicity", values = bar_colors) +
+                  facet_grid(. ~ centrality) +
+                  theme(axis.text.x = element_text(angle = 90, hjust = 1, 
+                                                   vjust = 0.5, lineheight = 1,
+                                                   size = 8),
+                        axis.title.y = element_text(size = 10),
+                        legend.title = element_text(size = 10),
+                        legend.text = element_text(size = 8))
+hub_multi_gg
+
+# Save the hub_multiplicity_gg plot as a pdf file and the hub_multi_df as csv
+ggsave(
+  "results/plots/hub_multiplicity.pdf", 
+  plot = hub_multi_gg, 
+  device = "pdf", 
+  width = 7, 
+  height = 3
+)
+```
+
+
+## Define organ-specific and shared hubs.
+Based on the previous stacked bar plot, we can see that, indeed, there are hubs that are specific for each organ, while others are ubiquitous. Let us separate them for downstream analysis:
+
+```{r}
+# Separate ubiquitious (multiplicity == 3+; top_centr_ub) from organ-specific  
+# hubs (multiplicity = 1; top_centr_sp). Both top_centr_ub and top_centr_sp are
+# lists of lists (outer list = CM, inner list = organs).
+top_centr_ub <- list()
+top_centr_sp <- list()
+for (centr in names(top_centr)) {
+  top_all <- table(unlist(top_centr[[centr]]))
+  top_centr_ub[[centr]] <- map(top_centr[[centr]], ~ .[top_all[.] >= 3])
+  top_centr_sp[[centr]] <- map(top_centr[[centr]], ~ .[top_all[.] == 1])
+}
+
+saveRDS(top_centr_ub, "results/R_objects/networks_hub_ubiquitous.rds")
+saveRDS(top_centr_sp, "results/R_objects/networks_hub_specific.rds")
+```
+
+# Node centrality correlates with gene essentiality
+
+According to graph theory, scale-free networks contain a great deal of nodes that are poorly connected, along with a few nodes that are highly connected. In this setting, scale-free networks are robust unless a hub is compromised. To validate this notion as well as the importance of most central genes in our networks, we will quantify the essentiality of each set of hubs. We take advantage of the Online GEne Essentiality database (OGEE), a database whose main purpose is to provide an unbiased, comprehensive catalogue of the essentiality of experimentally tested genes across species. Here, we will use the Mus musculus dataset (available  [here](http://ogee.medgenius.info/browse/Mus%20musculus), which contains the essentiality status for 9,402 genes of the mouse genome (as of January 2019).
+
+## Essentiality score vs centrality ranking
+
+To quantify the essentiality of each set of hubs, we compute an essentiality score (ES), which we define as follows:
+
+$$ES = \log2(\frac{\frac{E_{hub}}{NE_{hub}}}{\frac{E_{background}}{NE_{background}}})$$
+
+Where Ehubs and NEhubs are the number of essential and non-essential hubs in our networks, and Ebackground and NEbackground are the number of essential and non-essential genes in the OGEE dataset, respectively. We expect that this essentiality score decreases with the ranking of the genes by CM. To visualize that, we will take of sliding window of 500, and for each window we compute the essentiality score:
+
+```{r}
+# essential: df with essentiality status (essential or non-essential) for 
+# over 9,000 mouse genes
+essential <- read.csv(
+  file = "data/Mus musculus_consolidated.csv", 
+  header = TRUE
+)
+
+# density_ES: df with the essentiality status and ranking of each hub in each of
+# the 110 sets.
+density_ES <- data.frame(
+  gene_symbol = c(), 
+  rank = c(), 
+  essentiality_status = c(), 
+  essentiality_score = c(), 
+  organ = c(), 
+  centrality = c()
+)
+denominator_ratio <- table(essential$essentiality.status)[1] / 
+                     table(essential$essentiality.status)[2]
+centralities <- c("degree", "betweenness", "closeness", "eigen", "pagerank")
+organs <- names(net_graphs)
+
+for (centr in centralities) {
+  for (org in organs) { 
+    ranking <- sort(net_centr_l[[centr]][[org]], decreasing = TRUE)
+    essentiality_status <- names(ranking) %>%  
+      map_chr(~ ifelse(!(. %in% essential$symbols), 
+                       "NF", 
+                       essential[essential$symbols == ., "essentiality.status"]))
+    essentiality_score <- c()
+    i <- 1
+    
+    # Calculate the essentiality score for each sliding window of i + 500 genes
+    while (i + 500 <= length(ranking)) {
+      table_es_status <- table(essentiality_status[i:(i + 500)])
+      numerator_ratio <- table_es_status[1] / 
+        table_es_status[2]
+      curr_ES <- log2(numerator_ratio / denominator_ratio)    
+      essentiality_score <- c(essentiality_score, curr_ES)
+      i <- i + 1
+    }
+    end <- length(essentiality_score)
+    
+    # Create the current data frame for this organ and centrality, and bind it
+    # to the growing data frame (density_ES)
+    curr_ES_df <- data.frame(gene_symbol = names(ranking)[1:end], 
+                             rank = 1:end, 
+                             essentiality_status = essentiality_status[1:end], 
+                             essentiality_score = essentiality_score, 
+                             organ = rep(org, end), 
+                             centrality = rep(centr, end))
+    density_ES <- bind_rows(density_ES, curr_ES_df)
+  }
+}
+
+density_ES$essentiality_status <- density_ES$essentiality_status %>% 
+  as.character() %>% 
+  str_replace("1", "E") %>% 
+  str_replace("2", "NE")
+
+# Save density_ES as a tab-delimited text file in the output_tables folder
+write.table(
+  density_ES, 
+  "results/tables/essenciality_ranking_500.tsv",
+  sep = "\t"
+)
+
+# Plot and save the correlation between essenciality score and ranking for 
+# mammary gland network
+line_colors <- c("#9b9f9f", "#003d6e", "#f60015", "#f3b500", "#548444")
+density_ES$centrality <- factor(density_ES$centrality, levels = centralities)
+
+mammary_es_gg <- density_ES %>% 
+  filter(organ == "mammary") %>% 
+  ggplot(aes(rank, essentiality_score, color = centrality)) +
+    geom_line() +
+    geom_smooth(aes(rank, essentiality_score), color = "black") +
+    geom_hline(yintercept = 0) +
+    scale_y_continuous("Essentiality Score") +
+    scale_color_manual("", values = line_colors) +
+    ggtitle("MAMMARY GLAND\nREGULATORY NETWORK") +
+    theme_classic() +
+    theme(panel.border = element_rect(colour = "black", fill = NA),
+          plot.title = element_text(hjust = 0.5, size = 12))
+
+ggsave(
+  filename = "results/plots/mammary_essentiality_vs_rank.pdf", 
+  plot = mammary_es_gg, 
+  device = "pdf",
+  width = 8,
+  height = 8
+)
+
+# Plot and save the correlation between essenciality score and ranking for 
+# all organs:one plot per centrality, all organs in each plot (11 lines)
+centralities_es_gg <- map(centralities, ~  
+  filter(density_ES, centrality == .) %>% 
+  ggplot(aes(rank, essentiality_score, color = organ)) +
+    geom_line() +
+    geom_smooth(aes(rank, essentiality_score), color = "red") +
+    geom_hline(yintercept = 0) +
+    scale_y_continuous("Essentiality Score", limits = c(-1, 2)) +
+    scale_color_manual(values = rep("darkgrey", 11)) +
+    ggtitle(str_to_upper(.)) +
+    theme_classic() +
+    theme(panel.border = element_rect(colour = "black", fill = NA), 
+          legend.position = "none", 
+          plot.title = element_text(hjust = 0.5, size = 12))
+)
+names(centralities_es_gg) <- centralities
+centralities_es_gg[["pagerank"]] <- centralities_es_gg[["pagerank"]] +
+  geom_vline(xintercept = 600, linetype = "dashed") +
+  ggtitle("PAGERANK CENTRALITY\nACROSS ALL ORGANS") +
+  annotate("text", x = 600, y = -0.75, label = "Top\n10%", size = 4) 
+
+supp5 <- ggarrange(
+  plotlist = centralities_es_gg[c(2, 3, 1, 4)], 
+  nrow = 2, 
+  ncol = 2
+)
+ggsave(
+  filename = "results/plots/essentiality_vs_rank_all_organs&centralities.pdf", 
+  plot = supp5, 
+  device = "pdf",
+  width = 10,
+  height = 10
+)
+ggsave(
+  filename = "results/plots/essentiality_vs_rank_all_organs_pagerank.pdf", 
+  plot = centralities_es_gg[[5]],
+  device = "pdf", 
+  width = 8,
+  height = 8
+)
+mammary_es_gg
+centralities_es_gg
+supp5
+```
+
+As we can see, essentiality decreases with centrality, so this further validates our GRN reconstruction approach. 
+
+## Shared hubs are more essential than organ-specific hubs
+We will now compare the essentiality score between organ-specific and ubiquitous hubs. To that end, we will first compute the ES for every set of central genes (2 hub types x 5 CM x 11 organs = 110 ES). Then, for each ES we will calculate its statistical significance by calculating the ES of 10,000 random sets from the OGEE dataset of the same size as the observed one. We will find the p-value as the proportion of random ES that have a value equal or greater than the observed ES. We expect that ubiquitous hubs (those that are central in 3 or more organs) are more essential than the organ-specific ones.
+
+
+```{r}
+# net_df: df with 5 variables: gene symbol, organ,  centrality and 
+# essentiality status (NF (not found), E (essential), NE (non-essential))
+# for all hubs in the 110 sets.
+net_df <- data.frame(gene_symbol = c(), organ = c(), centrality = c())
+hubs_l <- list(specific = top_centr_sp, ubiquitous = top_centr_ub)
+hub_types <- names(hubs_l)
+
+for (hub_type in hub_types) {
+  for (centr in centralities) {
+    for (org in organs) {
+      symbols <- hubs_l[[hub_type]][[centr]][[org]]
+      n_row <- length(hubs_l[[hub_type]][[centr]][[org]])
+      curr_df <- data.frame(gene_symbol = symbols,
+                            organ = rep(org, n_row),
+                            centrality = rep(centr, n_row),
+                            hub_type = rep(hub_type, n_row))
+      net_df <- bind_rows(net_df, curr_df)
+    }
+  }
+}
+net_df$gene_symbol <- as.character(net_df$gene_symbol)
+essential$essentiality.status <- as.character(essential$essentiality.status)
+net_df$essentiality_status <- net_df$gene_symbol %>%  
+  map_chr(~ ifelse(
+    !(. %in% essential$symbols), 
+    "NF", 
+    essential[essential$symbols == ., "essentiality.status"]
+  )
+)
+                  
+# net_df_score: compute essentiality score for each of the 110 sets of hubs.
+set.seed(1)
+denominator_ratio <- table(essential$essentiality.status)[1] / 
+                     table(essential$essentiality.status)[2]
+net_df_score <- net_df %>% 
+  group_by(hub_type, organ, centrality) %>% 
+  summarise(numerator_ratio = sum(essentiality_status == "E") / 
+                              sum(essentiality_status == "NE")) %>% 
+  mutate(essentiality_score = log2(numerator_ratio / denominator_ratio))
+
+# Are the 110 ES statistically significant? Add a column of p-values to net_df_score
+get_random_ES <- function(n, essential_df, denominator_ratio){
+  # Generates a random essentiality score (ES) by picking n random genes from
+  # a dataset of the Online Gene ESsentiality database.
+  #
+  # Args:
+  #   n: integer indicating the number of random genes to pick from OGEE dataset
+  #   essential_df: data frame from which the genes will be randomly sampled
+  #   denominator_ratio: double indicating the denominator ratio for the ES
+  #                      computation (background)
+  #
+  # Returns:
+  #   A double corresponding to a random essentiality score.
+
+  essential_sample <- sample_n(essential_df, n)
+  essential_sample %>% 
+    dplyr::select(essentiality.status) %>% 
+    summarize(numerator_ratio = sum(essentiality.status == "E") /
+                                sum(essentiality.status == "NE")) %>% 
+    summarize(ES = log2(numerator_ratio / denominator_ratio)) %>% 
+    unlist()
+}
+
+hubs_counts <- net_df %>% 
+  filter(essentiality_status != "NF") %>% 
+  group_by(hub_type, organ, centrality) %>% 
+  summarize(count = n())
+net_df_score$count <- hubs_counts$count 
+net_df_score <- as.data.frame(net_df_score)
+p_values <- vector("double", nrow(net_df_score))
+
+for (i in 1:nrow(net_df_score)) {
+  es_distr <- replicate(
+    n = 10000, 
+    expr = get_random_ES(net_df_score$count[i], essential, denominator_ratio)
+  )
+  p_values[i] <- mean(es_distr > net_df_score$essentiality_score[i])
+}
+
+# Adjust p-values for multiples comparisons 
+net_df_score <- net_df_score %>% 
+  mutate(
+    p_values, 
+    adj_p_values = p.adjust(p_values, method = "fdr"),
+    significance = case_when(
+      adj_p_values < 0.005 ~ "***",
+      adj_p_values < 0.01 ~ "**",
+      adj_p_values < 0.05 ~ "*",
+      adj_p_values > 0.05 ~ "ns"
+    )
+  )
+
+# Save net_df_score
+net_df_score <- net_df_score %>% dplyr::select(1, 2, 3, 5, 7, 8, 9)
+file_name <- "results/tables/essentiality_table_by_hub_type.tsv"
+write.table(
+  net_df_score,
+  file = file_name, 
+  sep = "\t", 
+  col.names = TRUE, 
+  row.names = FALSE
+)
+
+# Generate and save plot
+net_df_score$centrality <- factor(net_df_score$centrality, levels = centralities)
+levels(net_df_score$centrality) <- centralities
+net_df_score$hub_type <- as.factor(net_df_score$hub_type)
+levels(net_df_score$hub_type) <- c("Specific", "Shared")
+org_essentiality_gg <- net_df_score %>%  
+  ggplot(aes(organ, essentiality_score, fill = hub_type)) + 
+  geom_col() +
+  geom_text(data = filter(net_df_score, significance != "ns"),
+            aes(label = significance), 
+            size = 3) +
+  scale_y_continuous(name = "Essentiality Score (ES)", limits = c(-0.5, 2.5)) +
+  scale_x_discrete(name = "") +
+  scale_fill_manual(name = NULL, values = c("#9e66ab", "#ff8533")) +
+  facet_grid(hub_type ~ centrality) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, 
+                                   lineheight = 1, size = 6),
+        axis.title.y = element_text(size = 8),
+        legend.text = element_text(size = 6),
+        strip.text.x = element_text(face = "italic"),
+        strip.text.y = element_blank())
+        
+
+org_essentiality_gg
+plot_name <- "results/plots/essentiality_hub_types.pdf"
+ggsave(plot_name, org_essentiality_gg, device = "pdf", width = 7,  height = 3)
+```
+
+As we can see, shared hubs are more essential than organ-specific. We can visualize this better with a radar chart, in which we compare the essentiality score across organs between shared and organ-specific hubs:
+
+```{r}
+page_df_l <- list()
+for (type in unique(net_df_score$hub_type)) {
+  df <- net_df_score %>% 
+    filter(centrality == "pagerank", hub_type == type) %>% 
+    ungroup %>%
+    dplyr::select("essentiality_score") %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    set_colnames(organs)
+  page_df_l[[type]] <- df
+}
+d <- rbind(rep(2.012181, 11), rep(-0.5, 11), page_df_l[[2]],  page_df_l[[1]])
+col_selection <- c("bladder", "spleen", "skin", "pancreas", "marrow", "mammary", 
+                   "lung", "intestine", "heart", "fat", "brain")
+d <- dplyr::select(d, col_selection)
+colnames(d) <-  str_to_title(col_selection)
+polygon_cols <- c(rgb(0, 149/255, 209/255, 0.6), rgb(224/255, 0, 0, 0.6))
+pdf("results/plots/radarchart_essentiality.pdf")
+print(radarchart(
+  d, 
+  pfcol = polygon_cols,
+  pcol = c("black", "black"),
+  plwd = 1,
+  plty = 1,
+  pty = 32,
+  cglcol = "black", cglty = 2, 
+  caxislabels = seq(0, 2, 0.5), axislabcol = "black", 
+  calcex = 1.15,
+  vlcex = 0.8,
+  axistype = 4
+))
+# legend(x = -0.5, y = 1.7, legend = c("Organ-specific", "Shared"),
+#        col = polygon_cols, bty = "n", pch = 15)
+dev.off()
+print(radarchart(
+  d, 
+  pfcol = polygon_cols,
+  pcol = c("black", "black"),
+  plwd = 1,
+  plty = 1,
+  pty = 32,
+  cglcol = "black", cglty = 2, 
+  caxislabels = seq(0, 2, 0.5), axislabcol = "black", 
+  calcex = 1.15,
+  vlcex = 0.8,
+  axistype = 4
+))
+
+# Save table
+rownames(d) <- c("axis_max", "axis_min", "ES_shared", "ES_specific")
+write.table(
+  d, 
+  file = "results/tables/radarchart_data.tsv", 
+  sep = "\t", 
+  col.names = TRUE, 
+  row.names = TRUE
+)
+```
+
+# Gene Ontology Enrichment Analysis
+
+As we saw before, among all networks and centralities there is a large proportion of hubs that are specific to that organ (organ-specific hubs, multiplicity 1, purple), as well as a large proportion of ubiquitous hubs (multiplicity 3+, orange). We hypothesize that those hubs with multiplicity 3+ (orange) are responsible for general and house-keeping functions within an organ; whilst those with multiplicty of 1 are responsible for organ-specific functions. We will assess such hypotheses by conducting a functional enrichment analysis using the Bioconductor package GOstats. Note that this package works with entrez ids, so we will need to convert the mgi symbols to entrez ids.
+
+```{r}
+# gene_off: chr vector with all the genes in the mouse genome used as gene 
+# universe. The aliases are converted to official mgi symbols
+gene_names <- unlist(read_tsv("data/gene_names.txt", col_names = FALSE))
+gene_off <- alias2SymbolTable(gene_names, species = "Mm")
+gene_off <- replace(
+  gene_off, 
+  which(is.na(gene_off)), 
+  gene_names[which(is.na(gene_off))]
+)
+ensembl <- useMart(
+  biomart = "ENSEMBL_MART_ENSEMBL", 
+  dataset = "mmusculus_gene_ensembl"
+)
+gene_univ_entrez <- getBM(
+  attributes = c("entrezgene", "mgi_symbol"), 
+  filters = "mgi_symbol", 
+  values = gene_off, 
+  mart = ensembl
+)
+
+# Gene Ontology enrichment analysis
+get_GOenrichment2 <- function(target, universe) {
+  # Performs a Gene Ontology enrichment analysis for a given target gene set and
+  # universe.
+  #
+  # Args:
+  #   target: character vector with the mgi symbols corresponding to the target
+  #           set.
+  #   universe: integer vector with the entrez symbols corresponding to the gene
+  #             universe. 
+  #
+  # Returns:
+  #   A data.frame with the GO id, the p-value, the Odds score and the 
+  #   description of every enriched GO term.
+  
+  params <- new(
+    "GOHyperGParams", 
+    geneIds = target, 
+    universeGeneIds = universe, 
+    annotation = "org.Mm.eg.db",
+    ontology = "BP", 
+    pvalueCutoff = 1, 
+    conditional = TRUE, 
+    testDirection = "over"
+  )
+  hgOver_df <- summary(hyperGTest(params))
+  go_results <- hgOver_df %>% 
+    arrange(desc(OddsRatio))
+  go_results
+}
+
+# Perform 11 organs x 5 CM x 2 sets (specific and ubiquitous) = 110 GO 
+# enrichment analyisis. org_sp and org_ub are two lists of lists that contain
+# the outputs of the analysis specific and ubiquitous hubs, respectively.
+enrich_sp_l2 <- vector("list", 11)
+enrich_ub_l2 <- vector("list", 11)
+names(enrich_sp_l2) <- organs
+names(enrich_ub_l2) <- organs
+
+for (org in organs) {
+  print(str_c("Starting GO enrichment of", org, "...", sep = " "))
+  target_entrez_sp <- gene_univ_entrez %>% 
+    filter(mgi_symbol %in% top_centr_sp$degree[[org]] & !is.na(entrezgene)) %>% 
+    dplyr::select("entrezgene") %>% 
+    as.list() %>% 
+    unlist() %>%
+    as.integer() %>% 
+    set_names(NULL)
+  enrich_sp_l2[[org]] <- get_GOenrichment2(
+    target = target_entrez_sp, 
+    universe = gene_univ_entrez$entrezgene
+  )
+  target_entrez_ub <- gene_univ_entrez %>% 
+    filter(mgi_symbol %in% top_centr_ub$degree[[org]] & !is.na(entrezgene)) %>% 
+    dplyr::select("entrezgene") %>% 
+    as.list() %>% 
+    unlist() %>% 
+    as.integer() %>% 
+    set_names(NULL)
+  enrich_ub_l2[[org]] <- get_GOenrichment2(
+    target = target_entrez_ub, 
+    universe = gene_univ_entrez$entrezgene
+  )
+}
+
+# Filter GO results to avoid too general or too specific results
+# map_dbl(top_centr_sp$degree, length) %>% sort()
+enrich_sp_l2_filt <- enrich_sp_l2 %>% 
+  map(filter, Size >= 3, Size <= 200, OddsRatio > 2, Pvalue < 0.05) %>% 
+  imap(~ filter(.x, Count >= case_when(
+    .y %in% c("skin", "brain", "pancreas") ~ 10,
+    .y %in% c("mammary", "intestine", "fat", "bladder") ~ 6,
+    .y %in% c("heart", "marrow", "lung", "spleen") ~ 4)
+  )
+)
+
+enrich_ub_l2_filt <- enrich_ub_l2 %>% 
+  map(filter, Size >= 3, Size <= 200, OddsRatio > 3, Pvalue < 0.05, Count == 10)
+
+# Save
+saveRDS(enrich_sp_l2_filt, file = "results/R_objects/enrichment_specific.rds")
+saveRDS(enrich_ub_l2_filt, file = "results/R_objects/enrichment_shared.rds")
+write.table(
+  gene_univ_entrez, 
+  file = "results/tables/gene_universe.tsv", 
+  sep = "\t", 
+  col.names = TRUE, 
+  row.names = FALSE
+)
+
+map(enrich_sp_l2_filt, head, 10)
+```
+
+
+# Expression multiplicity
+Finally, we aim to assess whether the organ-specific central genes are also specifically expressed. We hypothesize that network centrality is a much better predictor than expression specificity and, therefore, that not all organ-specific hubs, which we have shown to be essential and drive important functions, cannot be detected by expression alone.
+
+To detect such specificity, we will use the method described by Sonawane AR, et al. [in this paper](https://www.cell.com/cell-reports/comments/S2211-1247(17)31418-3). Briefly, we will load the mean expression of each gene in each organ. Then, for each expression average we substract the median expression of that gene across organs and divide that by the interquartile range (IQR). A gene X is then defined as specific in organ Y if the resulting z-score is > 2: 
+
+```{r}
+# expr_list: list of 11 chr vectors which contain the expression values for
+# all genes in the mouse transcriptome for 11 organs.
+expr_files <- str_c("data/expression", dir("data/expression/"), sep = "/")
+expr_list <- expr_files %>% 
+  map(read_csv, col_names = FALSE) %>% 
+  map(unlist) %>% 
+  map(set_names, gene_off)
+names(expr_list) <- organs
+
+
+# Expression specificity of organ-specific central genes
+# multi_df:
+multi_df <- data.frame(
+  centrality = c(), 
+  organ = c(), 
+  multiplicity = c(), 
+  percentage = c()
+)
+
+for (centr in centralities) {
+  for (org in organs) {
+    curr_counters <- c("other" = 0, "1" = 0)
+    for (gene in top_centr_sp[[centr]][[org]]) {
+      gene_expr <- map_dbl(expr_list, gene)
+      curr_mult <- sum((gene_expr - median(gene_expr)) / IQR(gene_expr) > 2)
+      if (is.na(curr_mult | curr_mult != 1)) {
+        next
+      }
+      if (curr_mult == 1) {
+        sorted_gene_expr <- sort(gene_expr, decreasing = TRUE)
+        org_top_expr <- names(sorted_gene_expr[1])
+        if (org_top_expr == org) {
+          curr_counters["1"] = curr_counters["1"] + 1
+        } else{
+          curr_counters["other"] = curr_counters["other"] + 1
+        }
+      }  
+    }
+    curr_counters_perc <- curr_counters / sum(curr_counters) * 100
+    curr_df = data.frame(
+      centrality = rep(centr, 2), 
+      organ = rep(org, 2), 
+      multiplicity = names(curr_counters), 
+      percentage = curr_counters_perc
+    )
+    multi_df <- rbind(multi_df, curr_df)
+  }
+}
+
+multi_df$multiplicity <- relevel(multi_df$multiplicity, "other")
+multi_gg <- multi_df %>% 
+  ggplot(aes(organ, percentage, fill = multiplicity)) + 
+  geom_bar(stat = "identity", color = "black", size = 0.25) +
+  facet_grid(. ~ centrality) +
+  scale_y_continuous("", 
+                     expand = c(0, 0), 
+                     labels = c("0%", "25%", "50%", "75%", "100%")) +
+  scale_fill_manual(values = c("#74869d", "#b2cf97"), 
+                    labels = c("Different organ", "Same organ")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, 
+                                   vjust = 0.5, lineheight = 1,
+                                   size = 7),
+        axis.text.y = element_text(size = 8),
+        legend.key.size = unit(0.25, "cm"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 7),
+        strip.text = element_text(size = 7.5))
+
+# Save table and plot
+write.table(
+  multi_df, 
+  file = "results/tables/expression_specificity.tsv", 
+  sep = "\t", 
+  col.names = TRUE, 
+  row.names = FALSE
+)
+ggsave(
+  plot = multi_gg, 
+  filename = "results/plots/expression_specificity.pdf", 
+  device = "pdf",
+  height = 2,
+  width = 7
+)
+multi_gg
+```
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
